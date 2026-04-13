@@ -4,6 +4,8 @@
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
 | 2026-03-03 | self | Initially assumed `AbortError` during voice join meant the connection was explicitly destroyed by overlapping starts. | Confirm `@discordjs/voice` error semantics in source; `entersState(..., timeout)` aborts with `AbortError` on timeout. |
+| 2026-03-04 | self | Upgrading to `@discordjs/voice@0.19.0` alone did not enable DAVE in production. | Install `@snazzah/davey` explicitly in app dependencies; otherwise `max_dave_protocol_version` stays `0` and post-2026-03-02 voice joins fail. |
+| 2026-03-04 | self | Left temporary high-volume diagnostics enabled after incident triage. | Gate voice handshake debug logs and dependency report behind `VOICE_DEBUG_LOGS=true`; keep default logs concise. |
 
 ## User Preferences
 - Keep responses concise and practical.
@@ -12,6 +14,7 @@
 - Use `rg` for fast repo-wide searches before patching.
 - For auto voice-start reliability, gate per-guild starts with a pending set and destroy stale `getVoiceConnection(guildId)` objects after failed readiness waits.
 - For npm release-date checks, parse `npm view <pkg> time --json` via Node and extract specific versions to avoid massive logs.
+- For recording lifecycle state, tag each recording with a unique `sessionId` and make transcript ingestion validate the active session before accepting chunks; this prevents late Deepgram events from a discarded call leaking into the next call.
 
 ## Patterns That Don't Work
 - None recorded yet.
@@ -21,6 +24,7 @@
 - User wants Anthropic model references modernized from Sonnet 3.7-era naming to `claude-sonnet-4-6`.
 - Anthropic model is hardcoded in `src/transcriptManager.ts` at each `anthropic.messages.create` call; keep these in sync when changing models.
 - `@anthropic-ai/sdk@0.38.0` in this repo lacks typed support for Claude 4.6 `thinking: {type: "adaptive"}` and `effort`; model string `claude-sonnet-4-6` still compiles.
+- 2026-04-13: `/cancel` previously only tore down the voice connection and active-recording sets; it did not clear buffered transcript state, so cancelled-call text could be merged into the next recording. Fix was to remove `/cancel`, make `/stop_recording` discard state, and key transcript buffers by per-recording `sessionId`.
 - 2026-02-19: User chose to keep current Anthropic integration as-is for now (no SDK upgrade yet). Revisit later to adopt Claude 4.6 `thinking: {type: "adaptive"}` + `effort` once SDK support is upgraded.
 - 2026-02-19: Deepgram streaming model remains `nova-3` for this bot; keep README/docs aligned with runtime model setting.
 - 2026-02-19: Summary prompts now include canonical-name normalization (Jan, Walter, Marcelo, Danny, Trey) and username mapping (`smalter` -> Walter, `loopboi` -> Danny), plus a one-line `Easter Egg` ending.
@@ -43,3 +47,4 @@
 - 2026-03-04: Upgraded runtime voice deps to `discord.js@14.25.1` and `@discordjs/voice@0.19.0`; old versions were `14.18.0`/`0.18.0`.
 - 2026-03-04: Added manual `/join` connection debug/state/error logs in `createReadyConnection` to diagnose handshake failures outside auto-start path.
 - 2026-03-04: Added internal networking `close` code probes (manual + auto paths) by hooking `newState.networking.on('close', code)` in state-change logger; needed to get definitive Discord-side rejection reason.
+- 2026-03-04: `@discordjs/voice@0.19.0` source dynamically imports `@snazzah/davey`, but does not ship it as a runtime dependency; this app must depend on `@snazzah/davey` directly.

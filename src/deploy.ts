@@ -16,11 +16,7 @@ export const commands = [
 	},
 	{
 		name: 'stop_recording',
-		description: 'Stop the current recording and generate a transcript',
-	},
-	{
-		name: 'cancel',
-		description: 'Cancel the current recording without generating a transcript',
+		description: 'Stop the current recording, leave the channel, and discard the transcript',
 	},
 ];
 

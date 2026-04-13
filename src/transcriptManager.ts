@@ -33,8 +33,17 @@ interface TranscriptMessage {
     timestamp: Date;
 }
 
-// Map of guild ID -> Map of user ID -> transcript data
-const transcripts = new Map<string, Map<string, TranscriptData>>();
+interface TranscriptSession {
+    guildId: string;
+    startedAt: Date;
+    users: Map<string, TranscriptData>;
+}
+
+// Map of session ID -> transcript data for that recording session.
+const transcriptSessions = new Map<string, TranscriptSession>();
+
+// Map of guild ID -> currently active transcript session ID.
+const activeTranscriptSessions = new Map<string, string>();
 const QUOTE_AUTHORS = [
     'Julius Caesar',
     'Seneca',
@@ -51,32 +60,72 @@ function pickRandomAuthor(): string {
 }
 
 /**
- * Add a message to the transcript
+ * Mark a transcript session as active for a guild.
+ */
+export function startTranscriptSession(guildId: string, sessionId: string) {
+    transcriptSessions.set(sessionId, {
+        guildId,
+        startedAt: new Date(),
+        users: new Map<string, TranscriptData>(),
+    });
+    activeTranscriptSessions.set(guildId, sessionId);
+    console.log(`🆕 Started transcript session ${sessionId} for guild ${guildId}`);
+}
+
+/**
+ * Remove transcript state for a session without generating output.
+ */
+export function discardTranscriptSession(guildId: string, sessionId: string) {
+    const didDelete = transcriptSessions.delete(sessionId);
+    if (activeTranscriptSessions.get(guildId) === sessionId) {
+        activeTranscriptSessions.delete(guildId);
+    }
+
+    console.log(
+        didDelete
+            ? `🗑️ Discarded transcript session ${sessionId} for guild ${guildId}`
+            : `ℹ️ No transcript session ${sessionId} found to discard for guild ${guildId}`
+    );
+}
+
+/**
+ * Add a message to the transcript.
  */
 export function addTranscriptMessage(
     guildId: string,
+    sessionId: string,
     userId: string,
     displayName: string,
     text: string
 ) {
-    // Get or create guild transcript map
-    if (!transcripts.has(guildId)) {
-        transcripts.set(guildId, new Map<string, TranscriptData>());
+    if (activeTranscriptSessions.get(guildId) !== sessionId) {
+        console.log(
+            `🛑 Ignoring late transcript chunk for guild ${guildId}; session ${sessionId} is no longer active`
+        );
+        return;
     }
-    
-    const guildTranscripts = transcripts.get(guildId)!;
-    
+
+    if (!transcriptSessions.has(sessionId)) {
+        transcriptSessions.set(sessionId, {
+            guildId,
+            startedAt: new Date(),
+            users: new Map<string, TranscriptData>(),
+        });
+    }
+
+    const session = transcriptSessions.get(sessionId)!;
+
     // Get or create user transcript data
-    if (!guildTranscripts.has(userId)) {
-        guildTranscripts.set(userId, {
+    if (!session.users.has(userId)) {
+        session.users.set(userId, {
             userId,
             displayName,
             messages: [],
             startTime: new Date()
         });
     }
-    
-    const userTranscript = guildTranscripts.get(userId)!;
+
+    const userTranscript = session.users.get(userId)!;
     
     // Add message to transcript
     userTranscript.messages.push({
@@ -88,16 +137,20 @@ export function addTranscriptMessage(
 }
 
 /**
- * Generate a transcript for a guild
+ * Generate a transcript for a recording session.
  */
-export async function generateTranscript(guildId: string, client: Client): Promise<string | null> {
-    const guildTranscripts = transcripts.get(guildId);
-    if (!guildTranscripts || guildTranscripts.size === 0) {
-        console.log(`⚠️ No transcript data found for guild ${guildId}`);
+export async function generateTranscript(guildId: string, sessionId: string, _client: Client): Promise<string | null> {
+    const session = transcriptSessions.get(sessionId);
+    if (!session || session.guildId !== guildId || session.users.size === 0) {
+        console.log(`⚠️ No transcript data found for guild ${guildId} in session ${sessionId}`);
+        if (activeTranscriptSessions.get(guildId) === sessionId) {
+            activeTranscriptSessions.delete(guildId);
+        }
+        transcriptSessions.delete(sessionId);
         return null;
     }
-    
-    console.log(`📄 Generating transcript for guild ${guildId} with ${guildTranscripts.size} speakers`);
+
+    console.log(`📄 Generating transcript for guild ${guildId} with ${session.users.size} speakers from session ${sessionId}`);
     
     // Collect all messages from all users
     const allMessages: {
@@ -107,7 +160,7 @@ export async function generateTranscript(guildId: string, client: Client): Promi
         timestamp: Date;
     }[] = [];
     
-    guildTranscripts.forEach((userData, userId) => {
+    session.users.forEach((userData, userId) => {
         userData.messages.forEach(message => {
             allMessages.push({
                 userId,
@@ -136,9 +189,12 @@ export async function generateTranscript(guildId: string, client: Client): Promi
     // Replace "WAP" with "Whop" (case-insensitive)
     let finalTranscript = transcript.trim().replace(/WAP/gi, 'Whop');
     
-    // Clear transcript data for this guild
-    transcripts.delete(guildId);
-    
+    // Clear transcript data for this session.
+    transcriptSessions.delete(sessionId);
+    if (activeTranscriptSessions.get(guildId) === sessionId) {
+        activeTranscriptSessions.delete(guildId);
+    }
+
     return finalTranscript;
 }
 

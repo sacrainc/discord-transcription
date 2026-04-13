@@ -39,6 +39,7 @@ export function createListeningStream(
 	displayName: string,
 	avatarUrl: string,
 	guildId?: string,
+	sessionId?: string,
 ) {
 	console.log(`🚀 Starting transcription for ${displayName} (${userId})`);
 	console.log(`🔗 Using webhook: ${webhook.id} in channel: ${webhook.channelId}`);
@@ -183,9 +184,9 @@ export function createListeningStream(
 			// We're no longer sending real-time transcripts to Discord
 			// Instead, just accumulate them for the final transcript
 			
-			// Add to transcript manager if guildId is provided
-			if (guildId) {
-				addTranscriptMessage(guildId, userId, displayName, text);
+			// Add to transcript manager if guild/session context is provided
+			if (guildId && sessionId) {
+				addTranscriptMessage(guildId, sessionId, userId, displayName, text);
 				console.log(`✅ Added message to transcript (not streaming to Discord)`);
 			}
 		} else {

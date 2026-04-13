@@ -65,8 +65,7 @@ To update the bot after making changes:
 - `/join` - Joins the voice channel you're in
 - `/record` - Starts recording everyone in the voice channel
 - `/leave` - Leaves the voice channel
-- `/stop_recording` - Stops recording and generates a transcript
-- `/cancel` - Stops recording without generating a transcript
+- `/stop_recording` - Stops recording, leaves the channel, and discards the transcript/summary
 
 ## Environment Variables
 
