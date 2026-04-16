@@ -30,9 +30,22 @@ interface RecordingData {
 
 const activeRecordings = new Map<string, RecordingData>();
 const pendingAutoStarts = new Set<string>();
+const intentionalDisconnects = new Map<string, string>();
 
 function createRecordingSessionId(guildId: string): string {
     return `${guildId}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function markIntentionalDisconnect(guildId: string, reason: string) {
+    intentionalDisconnects.set(guildId, reason);
+}
+
+function consumeIntentionalDisconnect(guildId: string): string | null {
+    const reason = intentionalDisconnects.get(guildId) ?? null;
+    if (reason) {
+        intentionalDisconnects.delete(guildId);
+    }
+    return reason;
 }
 
 /**
@@ -63,6 +76,8 @@ export async function handleVoiceStateUpdate(oldState: VoiceState, newState: Voi
 async function handleMemberJoin(state: VoiceState, client: Client) {
     const guildId = state.guild.id;
     const channelId = state.channelId;
+
+    intentionalDisconnects.delete(guildId);
     
     if (!channelId) return;
     
@@ -435,6 +450,14 @@ function setupRecording(
     
     // Handle connection state changes
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        const disconnectReason = consumeIntentionalDisconnect(guildId);
+        if (disconnectReason) {
+            console.log(
+                `ℹ️ Voice connection disconnected intentionally for guild ${guildId} (${disconnectReason}); skipping reconnect/finalize`
+            );
+            return;
+        }
+
         try {
             console.log(`⚠️ Voice connection disconnected, attempting to reconnect...`);
             // Try to reconnect if disconnected
@@ -503,6 +526,7 @@ export async function stopRecording(guildId: string, client: Client, isGracefulE
         activeRecordings.delete(guildId);
         
         // Now destroy the connection
+        markIntentionalDisconnect(guildId, 'finalize-recording');
         connection.destroy();
         console.log(`🛑 Destroyed voice connection for guild ${guildId}`);
         
@@ -598,6 +622,7 @@ export async function discardRecording(guildId: string) {
 
         // Destroy the connection
         if (connection) {
+            markIntentionalDisconnect(guildId, 'discard-recording');
             connection.destroy();
             console.log(`🛑 Destroyed voice connection for guild ${guildId} during discard`);
         }
@@ -735,6 +760,7 @@ export async function startManualRecording(
     }
     
     console.log(`🎙️ Starting manual recording in ${channelName} with ${humanMembers.size} members`);
+    intentionalDisconnects.delete(guildId);
     
     try {
         // Wait for the connection to be ready
