@@ -5,7 +5,7 @@ import * as path from 'path';
 interface Config {
     token: string;
     defaultChannel: string;
-    claudeApiKey?: string;
+    openaiApiKey?: string;
     deepgram_token?: string;
     transcriptChannelId?: string;
     voiceDebugLogs?: boolean;
@@ -25,13 +25,16 @@ try {
         config = {
             token: process.env.DISCORD_TOKEN || '',
             defaultChannel: process.env.DEFAULT_CHANNEL || 'transcripts',
-            claudeApiKey: process.env.CLAUDE_API_KEY,
+            openaiApiKey: process.env.OPENAI_API_KEY,
             deepgram_token: process.env.DEEPGRAM_TOKEN,
             transcriptChannelId: process.env.TRANSCRIPT_CHANNEL_ID,
             voiceDebugLogs: process.env.VOICE_DEBUG_LOGS === 'true'
         };
         console.log('🌐 Loaded configuration from environment variables');
     }
+
+    // Environment credentials can supplement local auth.json without embedding secrets.
+    config.openaiApiKey = process.env.OPENAI_API_KEY || config.openaiApiKey;
 
     // Validate required config
     if (!config.token) {

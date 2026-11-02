@@ -1,6 +1,7 @@
 import { Client, VoiceState, GuildMember, Collection, PermissionsBitField } from 'discord.js';
 import { joinVoiceChannel, VoiceConnection, entersState, VoiceConnectionStatus, getVoiceConnection } from '@discordjs/voice';
 import { createListeningStream } from './createListeningStream';
+import { TranscriptionHandle } from './liveTranscription';
 import {
     discardTranscriptSession,
     generateTranscript,
@@ -8,6 +9,8 @@ import {
     generateTitle,
     sendTranscriptAndSummary,
     startTranscriptSession,
+    sealTranscriptSession,
+    saveTranscript,
 } from './transcriptManager';
 import { getTranscriptChannel } from './utils';
 import config from './config';
@@ -25,11 +28,16 @@ interface RecordingData {
     recording: Set<string>;
     startTime: Date;
     notificationMessageId?: string;
+    finalization?: Promise<void>;
+    streams?: Set<TranscriptionHandle>;
+    detachSpeaking?: () => void;
     isManualRecording?: boolean; // Flag to indicate if this was started manually via /record
 }
 
 const activeRecordings = new Map<string, RecordingData>();
-const pendingAutoStarts = new Set<string>();
+let shuttingDown = false;
+const finalizations = new Set<Promise<void>>();
+const pendingRecordingStarts = new Set<string>();
 const intentionalDisconnects = new Map<string, string>();
 
 function createRecordingSessionId(guildId: string): string {
@@ -52,6 +60,7 @@ function consumeIntentionalDisconnect(guildId: string): string | null {
  * Handle voice state updates to automatically start/stop recordings
  */
 export async function handleVoiceStateUpdate(oldState: VoiceState, newState: VoiceState, client: Client) {
+    if (shuttingDown) return;
     // Skip bot voice state updates
     if (newState.member?.user.bot) return;
 
@@ -93,12 +102,14 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
     
     // Only start recording if there are at least 2 real human members
     if (memberCount >= 2) {
+        if (shuttingDown) return;
         // Check if we're already recording in this guild
         if (activeRecordings.has(guildId)) {
             console.log(`⏺️ Already recording in guild ${guildId}`);
             
             // If we're recording in a different channel, we might want to move
             const recordingData = activeRecordings.get(guildId)!;
+            if (recordingData.finalization) return;
             if (recordingData.channelId !== channelId) {
                 console.log(`🔄 Currently recording in ${recordingData.channelName}, but new activity in ${channel.name}`);
                 // For now, we'll stick with the current recording
@@ -111,7 +122,7 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
             return;
         }
 
-        if (pendingAutoStarts.has(guildId)) {
+        if (pendingRecordingStarts.has(guildId)) {
             console.log(`⏳ Automatic recording start already in progress for guild ${guildId}`);
             return;
         }
@@ -124,7 +135,7 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
         console.log(
             `🎙️ [auto-start:${attemptId}] Starting in ${channel.name} (${channel.id}) with ${memberCount} members: ${humanMemberNames}`
         );
-        pendingAutoStarts.add(guildId);
+        pendingRecordingStarts.add(guildId);
         
         try {
             const botMember = channel.guild.members.me;
@@ -252,6 +263,11 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
                 throw lastJoinError;
             }
             
+            if (shuttingDown) {
+                connection.destroy();
+                return;
+            }
+
             // Initialize recording data
             const sessionId = createRecordingSessionId(guildId);
             const recordable = new Set<string>();
@@ -279,6 +295,8 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
 
             startTranscriptSession(guildId, sessionId);
             
+            setupRecording(connection, recordable, recording, client, guildId, sessionId);
+
             // Send notification to transcript channel
             const notificationMessage = await sendRecordingNotification(
                 client, 
@@ -287,13 +305,11 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
                 currentHumanMembers
             );
             
-            if (notificationMessage) {
+            if (notificationMessage && activeRecordings.get(guildId)?.sessionId === sessionId) {
                 const recordingData = activeRecordings.get(guildId)!;
                 recordingData.notificationMessageId = notificationMessage.id;
             }
-            
-            // Set up the recording
-            setupRecording(connection, recordable, recording, client, guildId, sessionId);
+
             console.log(
                 `✅ [auto-start:${attemptId}] Recording setup complete for guild ${guildId} in ${channel.name}`
             );
@@ -325,7 +341,7 @@ async function handleMemberJoin(state: VoiceState, client: Client) {
                 }
             }
         } finally {
-            pendingAutoStarts.delete(guildId);
+            pendingRecordingStarts.delete(guildId);
             const elapsedMs = Date.now() - attemptStartedAt;
             console.log(`🏁 [auto-start:${attemptId}] Finished (elapsed ${elapsedMs}ms)`);
         }
@@ -363,11 +379,10 @@ async function handleMemberLeave(state: VoiceState, client: Client) {
         (!recordingData.isManualRecording && memberCount <= 1)) {
         console.log(`⏹️ Stopping recording in ${channel.name} as ${memberCount} human members remain`);
         
-        // Add a small delay to allow any final audio to be processed
-        console.log(`⏱️ Waiting 2 seconds before stopping recording to capture final audio...`);
-        setTimeout(async () => {
+        // Capture the session so a later leave event cannot stop a replacement recording.
+        if (activeRecordings.get(guildId)?.sessionId === recordingData.sessionId) {
             await stopRecording(guildId, client, true);
-        }, 2000);
+        }
     }
 }
 
@@ -384,72 +399,28 @@ function setupRecording(
 ) {
     const receiver = connection.receiver;
     
-    // Listen for speaking events
-    receiver.speaking.on('start', async (userId) => {
-        if (recordable.has(userId)) {
-            // Get the member
-            const guild = client.guilds.cache.get(guildId);
-            if (!guild) return;
-            
-            const member = await guild.members.fetch(userId).catch(() => null);
-            if (!member) return;
-            
-            const displayName = member.displayName;
-            
-            if (recording.has(userId)) {
-                // Already recording this user
-                return;
-            }
-            
-            recording.add(userId);
-            
-            // Get the webhook for the transcript channel
-            const transcriptChannel = await getTranscriptChannel(client);
-            if (!transcriptChannel) {
-                console.error(`❌ Could not find transcript channel`);
-                return;
-            }
-            
-            // Get the webhook for the channel
-            let webhook;
-            try {
-                const webhooks = await transcriptChannel.fetchWebhooks();
-                webhook = webhooks.first();
-                
-                if (!webhook) {
-                    webhook = await transcriptChannel.createWebhook({
-                        name: 'Transcript Webhook',
-                        avatar: client.user?.displayAvatarURL(),
-                    });
-                }
-            } catch (error) {
-                console.error(`❌ Error getting webhook: ${error}`);
-                return;
-            }
-            
-            // Get the user's avatar URL
-            const avatarUrl = member.displayAvatarURL();
-            
-            try {
-                createListeningStream(
-                    webhook,
-                    recording,
-                    receiver,
-                    userId,
-                    displayName,
-                    avatarUrl,
-                    guildId,
-                    sessionId
-                );
-            } catch (error) {
-                console.error(`❌ Error creating listening stream: ${error}`);
-                recording.delete(userId);
-            }
+    const data = activeRecordings.get(guildId);
+    if (!data || data.sessionId !== sessionId) return;
+    const streams = data.streams = new Set<TranscriptionHandle>();
+    const onSpeaking = (userId: string) => {
+        if (data.finalization || activeRecordings.get(guildId)?.sessionId !== sessionId || !recordable.has(userId) || recording.has(userId)) return;
+        recording.add(userId);
+        const member = client.guilds.cache.get(guildId)?.members.cache.get(userId);
+        try {
+            const stream = createListeningStream(recording, receiver, userId, member?.displayName || userId, guildId, sessionId);
+            streams.add(stream);
+            void stream.done.then(() => streams.delete(stream));
+        } catch (error) {
+            console.error('Error creating listening stream:', error);
+            recording.delete(userId);
         }
-    });
-    
+    };
+    receiver.speaking.on('start', onSpeaking);
+    data.detachSpeaking = () => receiver.speaking.off('start', onSpeaking);
+
     // Handle connection state changes
     connection.on(VoiceConnectionStatus.Disconnected, async () => {
+        if (data.finalization || activeRecordings.get(guildId)?.sessionId !== sessionId) return;
         const disconnectReason = consumeIntentionalDisconnect(guildId);
         if (disconnectReason) {
             console.log(
@@ -471,7 +442,7 @@ function setupRecording(
             console.log(`❌ Voice connection disconnected and couldn't reconnect: ${error}`);
             
             // Check if we're still recording in this guild
-            if (activeRecordings.has(guildId)) {
+            if (activeRecordings.get(guildId)?.sessionId === sessionId) {
                 console.log(`🛑 Attempting graceful shutdown after disconnection`);
                 try {
                     // Try to stop recording gracefully
@@ -500,98 +471,50 @@ export async function stopRecording(guildId: string, client: Client, isGracefulE
         return;
     }
     
+    if (recordingData.finalization) return recordingData.finalization;
+    const task = Promise.resolve().then(() => finalizeRecording(guildId, client, recordingData));
+    recordingData.finalization = task;
+    finalizations.add(task);
+    try { await task; } finally { finalizations.delete(task); }
+}
+
+async function finalizeRecording(guildId: string, client: Client, recordingData: RecordingData) {
+    const { connection, recording, recordable, sessionId } = recordingData;
+    recordingData.detachSpeaking?.();
+    const recordedUsers = Array.from(recordable).map(userId =>
+        client.guilds.cache.get(guildId)?.members.cache.get(userId)?.displayName || userId);
+    recordable.clear();
+    const streams = Array.from(recordingData.streams || []);
     try {
-        console.log(`🛑 Stopping recording for guild ${guildId} (graceful: ${isGracefulExit})`);
-        
-        // First, mark that we're stopping to prevent new recordings
-        const { connection, recording, recordable, sessionId } = recordingData;
-        
-        // If this is a graceful exit, wait a moment for any final audio to be processed
-        if (isGracefulExit) {
-            // We already added a delay before calling this function
-            console.log(`✅ Processing final audio before stopping recording`);
-        }
-        
-        // Clear recording sets to prevent new recordings
-        recording.clear();
-        
-        // Get recorded users
-        const recordedUsers = Array.from(recordable).map(userId => {
-            const member = client.guilds.cache.get(guildId)?.members.cache.get(userId);
-            return member ? member.displayName : userId;
-        });
-        
-        // Remove from active recordings map before destroying connection
-        // This prevents race conditions with the disconnection handler
-        activeRecordings.delete(guildId);
-        
-        // Now destroy the connection
+        for (const stream of streams) stream.stop();
+        await Promise.all(streams.map(stream => stream.done));
+        if (activeRecordings.get(guildId) === recordingData) activeRecordings.delete(guildId);
         markIntentionalDisconnect(guildId, 'finalize-recording');
-        connection.destroy();
-        console.log(`🛑 Destroyed voice connection for guild ${guildId}`);
-        
-        console.log(`✅ Successfully stopped recording in guild ${guildId}`);
-        
-        // Wait a moment for any final transcripts to be processed
-        await new Promise(resolve => setTimeout(resolve, 2000));
-        
-        // Generate transcript
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
+        sealTranscriptSession(guildId, sessionId);
+        recording.clear();
         const transcript = await generateTranscript(guildId, sessionId, client);
         if (!transcript) {
-            console.log(`⚠️ No transcript generated for guild ${guildId}`);
+            discardTranscriptSession(guildId, sessionId);
             await sendStopRecordingNotification(client, guildId, recordingData);
             return;
         }
-        
-        console.log(`📝 Generated transcript for guild ${guildId} (${transcript.length} chars)`);
-        
-        // Generate summary
-        const summary = await generateSummary(transcript);
-        if (!summary) {
-            console.log(`⚠️ No summary generated for guild ${guildId}`);
-            await sendStopRecordingNotification(client, guildId, recordingData);
-            return;
-        }
-        
-        console.log(`📋 Generated summary for guild ${guildId} (${summary.length} chars)`);
-        
-        // Generate title
-        const title = await generateTitle(summary);
-        console.log(`🏷️ Generated title for guild ${guildId}: ${title}`);
-        
-        // Send transcript and summary
-        await sendTranscriptAndSummary(
-            client,
-            guildId,
-            transcript,
-            summary,
-            title,
-            recordedUsers
-        );
+        const filepath = saveTranscript(guildId, sessionId, transcript);
+        console.log(`Saved transcript before AI generation: ${filepath}`);
+        const title = `Meeting Transcript (${recordingData.startTime.toLocaleDateString()})`;
+        const delivered = await sendTranscriptAndSummary(client, guildId, transcript, null, title, recordedUsers, sessionId,
+            async () => {
+                if (shuttingDown) return { summary: null, title };
+                const summary = await generateSummary(transcript);
+                return { summary, title: summary && !shuttingDown ? await generateTitle(summary) : title };
+            });
+        if (delivered) discardTranscriptSession(guildId, sessionId);
     } catch (error) {
-        console.error(`❌ Error stopping recording: ${error}`);
-        
-        // Try to send a basic notification
-        try {
-            if (recordingData) {
-                await sendStopRecordingNotification(client, guildId, recordingData);
-            }
-        } catch (innerError) {
-            console.error(`❌ Error sending stop notification: ${innerError}`);
-        }
-        
-        // Make sure we clean up even if there was an error
-        if (activeRecordings.has(guildId)) {
-            const data = activeRecordings.get(guildId);
-            if (data && data.connection) {
-                try {
-                    data.connection.destroy();
-                } catch (err) {
-                    console.error(`❌ Error destroying connection during cleanup: ${err}`);
-                }
-            }
-            activeRecordings.delete(guildId);
-        }
+        console.error(`Error finalizing session ${sessionId}; transcript state retained:`, error);
+        for (const stream of streams) stream.abort();
+        sealTranscriptSession(guildId, sessionId);
+        if (activeRecordings.get(guildId) === recordingData) activeRecordings.delete(guildId);
+        if (connection.state.status !== VoiceConnectionStatus.Destroyed) connection.destroy();
     }
 }
 
@@ -605,6 +528,8 @@ export async function discardRecording(guildId: string) {
         return false;
     }
 
+    if (recordingData.finalization) return false;
+
     try {
         console.log(`🛑 Discarding recording for guild ${guildId}`);
 
@@ -616,6 +541,9 @@ export async function discardRecording(guildId: string) {
 
         // Remove from active recordings map before destroying connection
         activeRecordings.delete(guildId);
+
+        recordingData.detachSpeaking?.();
+        for (const stream of recordingData.streams || []) stream.abort();
 
         // Mark this session as discarded immediately so any late Deepgram events are ignored.
         discardTranscriptSession(guildId, sessionId);
@@ -741,12 +669,14 @@ export async function startManualRecording(
     connection: VoiceConnection,
     client: Client
 ) {
+    if (shuttingDown) return false;
     // Check if we're already recording in this guild
     if (activeRecordings.has(guildId)) {
         console.log(`⏺️ Already recording in guild ${guildId}`);
         
         // If we're recording in this channel, add the user to recordable
         const recordingData = activeRecordings.get(guildId)!;
+        if (recordingData.finalization || recordingData.channelId !== channelId) return false;
         if (recordingData.channelId === channelId) {
             humanMembers.forEach(member => {
                 if (!recordingData.recordable.has(member.id)) {
@@ -756,9 +686,11 @@ export async function startManualRecording(
             });
         }
         
-        return;
+        return true;
     }
     
+    if (pendingRecordingStarts.has(guildId)) return false;
+    pendingRecordingStarts.add(guildId);
     console.log(`🎙️ Starting manual recording in ${channelName} with ${humanMembers.size} members`);
     intentionalDisconnects.delete(guildId);
     
@@ -767,6 +699,11 @@ export async function startManualRecording(
         await entersState(connection, VoiceConnectionStatus.Ready, 20e3);
         console.log(`✅ Connected to voice channel ${channelName}`);
         
+        if (shuttingDown) {
+            connection.destroy();
+            return false;
+        }
+
         // Initialize recording data
         const sessionId = createRecordingSessionId(guildId);
         const recordable = new Set<string>();
@@ -791,6 +728,8 @@ export async function startManualRecording(
 
         startTranscriptSession(guildId, sessionId);
         
+        setupRecording(connection, recordable, recording, client, guildId, sessionId);
+
         // Send notification to transcript channel
         const notificationMessage = await sendRecordingNotification(
             client, 
@@ -799,17 +738,23 @@ export async function startManualRecording(
             humanMembers
         );
         
-        if (notificationMessage) {
+        if (notificationMessage && activeRecordings.get(guildId)?.sessionId === sessionId) {
             const recordingData = activeRecordings.get(guildId)!;
             recordingData.notificationMessageId = notificationMessage.id;
         }
-        
-        // Set up the recording
-        setupRecording(connection, recordable, recording, client, guildId, sessionId);
-        
+
         return true;
     } catch (error) {
         console.error(`❌ Error starting manual recording: ${error}`);
         return false;
+    } finally {
+        pendingRecordingStarts.delete(guildId);
     }
 } 
+
+/** Drain active audio and deliver attachments before exiting; skip new AI requests during shutdown. */
+export async function shutdownRecordings(client: Client): Promise<void> {
+    shuttingDown = true;
+    await Promise.all(Array.from(activeRecordings.keys()).map(guildId => stopRecording(guildId, client, true)));
+    await Promise.all(Array.from(finalizations));
+}

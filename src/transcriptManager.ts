@@ -2,22 +2,30 @@ import { Client, AttachmentBuilder } from 'discord.js';
 import { getTranscriptChannel } from './utils';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Anthropic } from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import config from './config';
 
-const { claudeApiKey } = config;
+export const SUMMARY_MODEL = 'gpt-6.1-sol';
+const openai = config.openaiApiKey ? new OpenAI({
+    apiKey: config.openaiApiKey,
+    timeout: 20_000,
+    maxRetries: 1,
+}) : null;
 
-// Initialize Anthropic client
-let anthropic: Anthropic | null = null;
-if (claudeApiKey) {
-    try {
-        anthropic = new Anthropic({
-            apiKey: claudeApiKey,
-        });
-        console.log('✅ Anthropic client initialized successfully');
-    } catch (error) {
-        console.error('❌ Failed to initialize Anthropic client:', error);
+async function generateText(instructions: string, input: string, maxOutputTokens: number): Promise<string> {
+    if (!openai) throw new Error('OPENAI_API_KEY is not configured');
+    const response = await openai.responses.create({
+        model: SUMMARY_MODEL,
+        instructions,
+        input,
+        max_output_tokens: maxOutputTokens,
+        reasoning: { effort: 'low' },
+        store: false,
+    });
+    if (response.status !== 'completed' || !response.output_text?.trim()) {
+        throw new Error(`OpenAI response did not complete with text (${response.status})`);
     }
+    return response.output_text.trim();
 }
 
 // Store transcripts by guild ID and user ID
@@ -37,6 +45,7 @@ interface TranscriptSession {
     guildId: string;
     startedAt: Date;
     users: Map<string, TranscriptData>;
+    accepting: boolean;
 }
 
 // Map of session ID -> transcript data for that recording session.
@@ -67,6 +76,7 @@ export function startTranscriptSession(guildId: string, sessionId: string) {
         guildId,
         startedAt: new Date(),
         users: new Map<string, TranscriptData>(),
+        accepting: true,
     });
     activeTranscriptSessions.set(guildId, sessionId);
     console.log(`🆕 Started transcript session ${sessionId} for guild ${guildId}`);
@@ -76,6 +86,7 @@ export function startTranscriptSession(guildId: string, sessionId: string) {
  * Remove transcript state for a session without generating output.
  */
 export function discardTranscriptSession(guildId: string, sessionId: string) {
+    if (transcriptSessions.get(sessionId)?.guildId !== guildId) return;
     const didDelete = transcriptSessions.delete(sessionId);
     if (activeTranscriptSessions.get(guildId) === sessionId) {
         activeTranscriptSessions.delete(guildId);
@@ -98,22 +109,8 @@ export function addTranscriptMessage(
     displayName: string,
     text: string
 ) {
-    if (activeTranscriptSessions.get(guildId) !== sessionId) {
-        console.log(
-            `🛑 Ignoring late transcript chunk for guild ${guildId}; session ${sessionId} is no longer active`
-        );
-        return;
-    }
-
-    if (!transcriptSessions.has(sessionId)) {
-        transcriptSessions.set(sessionId, {
-            guildId,
-            startedAt: new Date(),
-            users: new Map<string, TranscriptData>(),
-        });
-    }
-
-    const session = transcriptSessions.get(sessionId)!;
+    const session = transcriptSessions.get(sessionId);
+    if (!session || session.guildId !== guildId || !session.accepting) return;
 
     // Get or create user transcript data
     if (!session.users.has(userId)) {
@@ -143,10 +140,6 @@ export async function generateTranscript(guildId: string, sessionId: string, _cl
     const session = transcriptSessions.get(sessionId);
     if (!session || session.guildId !== guildId || session.users.size === 0) {
         console.log(`⚠️ No transcript data found for guild ${guildId} in session ${sessionId}`);
-        if (activeTranscriptSessions.get(guildId) === sessionId) {
-            activeTranscriptSessions.delete(guildId);
-        }
-        transcriptSessions.delete(sessionId);
         return null;
     }
 
@@ -187,34 +180,25 @@ export async function generateTranscript(guildId: string, sessionId: string, _cl
     });
     
     // Replace "WAP" with "Whop" (case-insensitive)
-    let finalTranscript = transcript.trim().replace(/WAP/gi, 'Whop');
+    const finalTranscript = transcript.trim().replace(/\bWAP\b/gi, 'Whop');
     
-    // Clear transcript data for this session.
-    transcriptSessions.delete(sessionId);
-    if (activeTranscriptSessions.get(guildId) === sessionId) {
-        activeTranscriptSessions.delete(guildId);
-    }
-
     return finalTranscript;
 }
 
 /**
- * Generate a summary of a transcript using Claude
+ * Generate a summary of a transcript using OpenAI
  */
 export async function generateSummary(transcript: string): Promise<string | null> {
-    if (!claudeApiKey || !anthropic) {
-        console.error('❌ No Claude API key found in auth.json or client initialization failed!');
+    if (!openai) {
+        console.error('❌ OPENAI_API_KEY is not configured!');
         return null;
     }
     
     const selectedAuthor = pickRandomAuthor();
-    console.log(`🤖 Generating summary using Claude (quote author: ${selectedAuthor})...`);
+    console.log(`🤖 Generating summary using OpenAI (quote author: ${selectedAuthor})...`);
     
     try {
-        const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 8000,
-            system: `You are a helpful assistant that converts raw meeting transcripts among colleagues at the company Sacra into a clear, concise summary. YOUR SUMMARY MUST BE 250 WORDS MAXIMUM.
+        const summary = await generateText(`You are a helpful assistant that converts raw meeting transcripts among colleagues at the company Sacra into a clear, concise summary. YOUR SUMMARY MUST BE 250 WORDS MAXIMUM.
 
 Your goal is to produce a well-structured Markdown summary in this style:
 
@@ -246,24 +230,9 @@ Instructions:
 
 BEGIN YOUR RESPONSE WITH THE HIGH-LEVEL OVERVIEW. DO NOT ADD ANY PREFACE OR MENTION THE FACT THAT YOU'RE STARTING YOUR SUMMARY. DO NOT START WITH A "### SUMMARY" HEADER OR A "SUMMARY:" OR ANYTHING LIKE THAT.
 The closing quote must be the final line of the entire response, and it must use exactly this format:
-"<quote>" — ${selectedAuthor}`,
-            messages: [
-                {
-                    role: 'user',
-                    content: transcript
-                }
-            ]
-        });
-        
-        // Check if the content is a text block
-        if (response.content[0].type === 'text') {
-            const summary = response.content[0].text;
-            console.log(`✅ Generated summary (${summary.length} chars)`);
-            return summary;
-        } else {
-            console.error('❌ Unexpected response format from Claude');
-            return null;
-        }
+"<quote>" — ${selectedAuthor}`, transcript, 8000);
+        console.log(`Generated summary (${summary.length} chars)`);
+        return summary;
     } catch (error) {
         console.error(`❌ Error generating summary: ${error}`);
         return null;
@@ -271,23 +240,20 @@ The closing quote must be the final line of the entire response, and it must use
 }
 
 /**
- * Generate a title for a meeting using Claude
+ * Generate a title for a meeting using OpenAI
  */
 export async function generateTitle(summary: string): Promise<string> {
-    if (!claudeApiKey || !anthropic) {
-        console.error('❌ No Claude API key found in auth.json or client initialization failed!');
+    if (!openai) {
+        console.error('❌ OPENAI_API_KEY is not configured!');
         return `Meeting Transcript (${new Date().toLocaleDateString()})`;
     }
     
-    console.log(`🏷️ Generating title using Claude...`);
+    console.log(`🏷️ Generating title using OpenAI...`);
     
     try {
         const date = new Date().toLocaleDateString('en-US', { month: '2-digit', day: '2-digit', year: 'numeric' });
         
-        const response = await anthropic.messages.create({
-            model: 'claude-sonnet-4-6',
-            max_tokens: 50,
-            system: `You are a helpful assistant that creates concise, descriptive titles for meeting summaries.
+        const title = await generateText(`You are a helpful assistant that creates concise, descriptive titles for meeting summaries.
                 
 Instructions:
 1. Read the meeting summary and identify the main topic or purpose of the meeting.
@@ -296,149 +262,109 @@ Instructions:
 4. Format should be: "Main Topic (${date})"
 5. Examples: "Product Roadmap Discussion (${date})", "Team Standup Meeting (${date})", "Client Onboarding Call (${date})"
 
-Your response should ONLY include the title, nothing else.`,
-            messages: [
-                {
-                    role: 'user',
-                    content: summary
-                }
-            ]
-        });
-        
-        // Check if the content is a text block
-        if (response.content[0].type === 'text') {
-            const title = response.content[0].text.trim();
-            console.log(`✅ Generated title: ${title}`);
-            return title;
-        } else {
-            console.error('❌ Unexpected response format from Claude');
-            return `Meeting Transcript (${new Date().toLocaleDateString()})`;
-        }
+Your response should ONLY include the title, nothing else.`, summary, 2000);
+        return title.replace(/\s+/g, ' ').slice(0, 200);
     } catch (error) {
         console.error(`❌ Error generating title: ${error}`);
         return `Meeting Transcript (${new Date().toLocaleDateString()})`;
     }
 }
 
-function splitSummaryIntoSections(summary: string): string[] {
-    const trimmed = summary.trim();
-    if (!trimmed) return [];
-
-    // Split only at section boundaries; each block starts with an H3 heading.
-    const sections = trimmed
-        .split(/\n(?=###\s)/g)
-        .map(section => section.trim())
-        .filter(Boolean);
-
-    return sections.length > 0 ? sections : [trimmed];
+/** Stop ingestion after all transcription sockets have drained. Retain data until delivery. */
+export function sealTranscriptSession(guildId: string, sessionId: string) {
+    const session = transcriptSessions.get(sessionId);
+    if (session?.guildId === guildId) session.accepting = false;
+    if (activeTranscriptSessions.get(guildId) === sessionId) activeTranscriptSessions.delete(guildId);
 }
 
-function chunkSectionsForDiscord(
+/** Prefer section boundaries, falling back to lines/words for oversized sections. */
+export function chunkSectionsForDiscord(
     title: string,
     recordedUsers: string[],
     summary: string,
     discordCharLimit = 1950
 ): string[] {
     const header = `**${title}**\n\n**Recording finished for:** ${recordedUsers.join(', ')}\n\n**Summary:**\n`;
-    const sections = splitSummaryIntoSections(summary);
-
-    // Fast path: one message fits.
-    const fullMessage = `${header}${summary}`;
-    if (fullMessage.length <= discordCharLimit) return [fullMessage];
-
-    // Build messages using whole sections only. Only the first message includes metadata/header.
+    const sections = `${header}${summary}`.trim().split(/\n(?=###\s)/g);
     const messages: string[] = [];
-    let current = header;
-
-    for (const section of sections) {
-        const separator = current.endsWith('\n') ? '' : '\n\n';
-        const candidate = `${current}${separator}${section}`;
-
-        if (candidate.length <= discordCharLimit) {
-            current = candidate;
+    let current = '';
+    for (let section of sections) {
+        if (current && current.length + 2 + section.length <= discordCharLimit) {
+            current += `\n\n${section}`;
             continue;
         }
-
-        // Commit current message and start a new message with only remaining summary sections.
-        if (current !== header) {
-            messages.push(current);
-            current = section;
-            continue;
+        if (current) messages.push(current);
+        while (section.length > discordCharLimit) {
+            let cut = section.lastIndexOf('\n', discordCharLimit);
+            if (cut < discordCharLimit / 2) cut = section.lastIndexOf(' ', discordCharLimit);
+            if (cut < discordCharLimit / 2) cut = discordCharLimit;
+            // Avoid splitting a UTF-16 surrogate pair (e.g. emoji).
+            if (/[\uD800-\uDBFF]/.test(section[cut - 1])) cut--;
+            messages.push(section.slice(0, cut));
+            section = section.slice(cut).trimStart();
         }
-
-        // If a single section cannot fit even alone, send it whole in its own message.
-        // This preserves "no split within a section" even if Discord rejects due size.
-        messages.push(current);
         current = section;
     }
-
-    if (current !== header) {
-        messages.push(current);
-    }
-
+    if (current) messages.push(current);
     return messages;
 }
 
-/**
- * Send transcript and summary to the transcript channel
- */
+/** Save the raw transcript before requesting optional AI output or contacting Discord. */
+export function saveTranscript(guildId: string, sessionId: string, transcript: string): string {
+    const transcriptDir = path.join(process.cwd(), 'transcripts');
+    fs.mkdirSync(transcriptDir, { recursive: true });
+    const filename = `transcript-${guildId}-${sessionId.replace(/[^a-zA-Z0-9-]/g, '_')}.md`;
+    const filepath = path.join(transcriptDir, filename);
+    fs.writeFileSync(filepath, transcript, { encoding: 'utf8', mode: 0o600 });
+    return filepath;
+}
+
+/** The attachment is delivered with the first message, so later summary errors cannot block it. */
 export async function sendTranscriptAndSummary(
     client: Client,
     guildId: string,
     transcript: string,
-    summary: string,
+    summary: string | null,
     title: string,
-    recordedUsers: string[]
-) {
+    recordedUsers: string[],
+    sessionId: string,
+    enrich?: () => Promise<{ summary: string | null; title: string }>
+): Promise<boolean> {
+    const filepath = saveTranscript(guildId, sessionId, transcript);
     try {
-        // Log the Claude-generated summary
-        console.log(`🤖 Claude-generated summary:\n${summary}`);
-        
-        // Get the transcript channel
         const transcriptChannel = await getTranscriptChannel(client);
-        if (!transcriptChannel) {
-            console.error(`❌ Could not find transcript channel`);
-            return;
-        }
-        
-        // Split summary into one or more Discord-safe messages at section boundaries.
-        const summaryMessages = chunkSectionsForDiscord(title, recordedUsers, summary, 1950);
-        console.log(`📨 Sending summary in ${summaryMessages.length} message(s)`);
-
-        for (const [index, message] of summaryMessages.entries()) {
-            if (message.length > 1950) {
-                console.error(`❌ Summary message part ${index + 1} exceeds Discord limit (${message.length} chars).`);
-            }
-            await transcriptChannel.send(message);
-        }
-        
-        // Format the transcript in markdown
-        const transcriptMd = `# ${title}\n\n${transcript}`;
-        
-        // Create transcript file
-        const transcriptDir = path.join(process.cwd(), 'transcripts');
-        if (!fs.existsSync(transcriptDir)) {
-            fs.mkdirSync(transcriptDir, { recursive: true });
-        }
-        
-        const filename = `transcript-${Date.now()}.md`;
-        const filepath = path.join(transcriptDir, filename);
-        
-        fs.writeFileSync(filepath, transcriptMd);
-        
-        // Create file attachment
-        const attachment = new AttachmentBuilder(filepath, { name: filename });
-        
-        // Send the transcript file
-        await transcriptChannel.send({
-            content: '**Full Transcript:**',
-            files: [attachment]
+        if (!transcriptChannel) throw new Error('Could not find transcript channel');
+        let messages = chunkSectionsForDiscord(title, recordedUsers, summary || 'Summary unavailable. The full transcript is attached.');
+        const firstMessage = await transcriptChannel.send({
+            content: messages[0],
+            files: [new AttachmentBuilder(Buffer.from(`# ${title}\n\n${transcript}`), { name: path.basename(filepath) })],
+            allowedMentions: { parse: [] },
         });
-        
-        console.log(`✅ Sent transcript and summary to ${transcriptChannel.name}`);
+        // Deliver first. Enrichment cannot delay or prevent the raw transcript attachment.
+        if (enrich) {
+            try {
+                const result = await enrich();
+                if (result.summary) {
+                    messages = chunkSectionsForDiscord(result.title, recordedUsers, result.summary);
+                    await firstMessage.edit({ content: messages[0], allowedMentions: { parse: [] } });
+                }
+            } catch (error) {
+                console.error('Summary enrichment failed; full transcript was delivered:', error);
+                return true;
+            }
+        }
+        // The complete transcript is now delivered. Optional continuation failures do not undo delivery.
+        for (const content of messages.slice(1)) {
+            try {
+                await transcriptChannel.send({ content, allowedMentions: { parse: [] } });
+            } catch (error) {
+                console.error('Failed to send summary continuation; full transcript was delivered:', error);
+                break;
+            }
+        }
         return true;
     } catch (error) {
-        console.error(`❌ Error sending transcript and summary: ${error}`);
+        console.error(`Transcript delivery failed; retained at ${filepath}:`, error);
         return false;
     }
-} 
+}

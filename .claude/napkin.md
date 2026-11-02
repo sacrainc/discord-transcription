@@ -48,3 +48,21 @@
 - 2026-03-04: Added manual `/join` connection debug/state/error logs in `createReadyConnection` to diagnose handshake failures outside auto-start path.
 - 2026-03-04: Added internal networking `close` code probes (manual + auto paths) by hooking `newState.networking.on('close', code)` in state-change logger; needed to get definitive Discord-side rejection reason.
 - 2026-03-04: `@discordjs/voice@0.19.0` source dynamically imports `@snazzah/davey`, but does not ship it as a runtime dependency; this app must depend on `@snazzah/davey` directly.
+
+## 2026-11-02 workspace correction
+- Correct repository: janerikasplund/discord-transcription. Heroku app: discord-transcription-bot.
+- As of 2026-11-02 Heroku main abedb4b is one commit ahead of GitHub main 0ec486c. Start changes from deployed head to preserve intentional-disconnect fix.
+- OPENAI_API_KEY already set on Heroku without displaying secret. Never print .env.local or config values.
+- Review findings: summary failure prevents transcript delivery; oversized summary blocks attachment; transcript state deleted before successful delivery; per-utterance signal listeners accumulate; audio before Deepgram Open is dropped; final drain uses fixed 2 seconds.
+- Prior Python migration belongs to wrong repository; patch archived at /Users/jasplund/Developer/discord-transcription-python-migration.patch and tracked edits reverted there.
+- Self correction: hidden tracked napkin was missed by rg --files; restored original notes and appended findings. Always check hidden instruction files explicitly.
+
+## 2026-11-02 implementation notes
+- User confirmed target model is `gpt-6.1-sol` for both summaries and titles; use OpenAI Responses with low reasoning and `store: false`. Claude integration is replaced.
+- Deliver transcript attachment BEFORE requesting AI output; edit the first Discord message afterward to preserve the original summary layout. Summary/title failures must not prevent transcript delivery.
+- Decode raw Discord Opus to stereo 48 kHz linear16 before sending to Deepgram. Capture synchronously without member/webhook network lookups; buffer PCM until Open and wait for CloseStream completion with bounded deadlines.
+- Regression test stubs for TypeScript default imports must set `__esModule: true` when exporting `{ default: ... }`; otherwise `__importDefault` wraps the stub twice and silently hides configuration.
+- Native audio regression test caught `prism-media@2.0.0-alpha.0` throwing `ERR_OUT_OF_RANGE` when checking Opus headers on valid 3-byte silence packets. Use stable `prism-media@1.3.5`; its decoder handles these packets correctly.
+- 2026-11-02: Live synthetic OpenAI Responses smoke test succeeded for `gpt-6.1-sol` using the existing Heroku key (key never printed). Code remains local until explicitly deployed.
+- Final local verification: `npm test` passes 16 tests (native Opus short-packet decode, pre-Open buffering, final drain, errors/deadlines, concurrent starts/stops, discard, shutdown, failed delivery retention, session isolation, Discord limits, OpenAI request schema). `npm run build:check` and `git diff --check` pass.
+- Remaining operational limit: failed delivery files are local and Heroku's filesystem is ephemeral; there is no automatic durable redelivery queue. README documents this explicitly.

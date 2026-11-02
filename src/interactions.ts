@@ -1,19 +1,9 @@
 import { DiscordGatewayAdapterCreator, entersState, joinVoiceChannel, VoiceConnection, VoiceConnectionStatus, getVoiceConnection } from '@discordjs/voice';
-import { Client, ChatInputCommandInteraction, GuildMember, Snowflake, User, ChannelType, TextChannel, DiscordAPIError } from 'discord.js';
-import { createListeningStream } from './createListeningStream';
+import { Client, ChatInputCommandInteraction, GuildMember, Snowflake } from 'discord.js';
 import { discardRecording, isRecording, stopRecording, startManualRecording } from './voiceStateManager';
 import config from './config';
 
-const { defaultChannel, voiceDebugLogs } = config;
-
-function getDisplayName(interaction: ChatInputCommandInteraction, client: Client, userId: string) {
-    const member = interaction.guild?.members.cache.get(userId);
-    if (member instanceof GuildMember) { 
-        return member.displayName;
-    }
-    const user: User | undefined = client.users.cache.get(userId);
-	return (user ? `${user.username}` : userId);
-}
+const { voiceDebugLogs } = config;
 
 async function createReadyConnection(
 	channel: NonNullable<GuildMember['voice']['channel']>,
@@ -154,74 +144,6 @@ async function join(
 
 	try {
 		await entersState(connection, VoiceConnectionStatus.Ready, 5e3);
-		const receiver = connection.receiver;
-
-		receiver.speaking.on('start', async (userId) => {
-			if (recordable.has(userId)) {
-                const displayName: string = getDisplayName(interaction, client, userId);
-
-                if (recording.has(userId)) { 
-                    //console.log(`✋ Already recording ${displayName}!`); 
-                    return 
-                }
-
-                recording.add(userId);
-
-                try {
-                    // Find our default channel, if it exists
-                    const channel = client.channels.cache.find(
-                        channel => channel && 
-                        channel.type === ChannelType.GuildText && 
-                        'name' in channel && 
-                        channel.name === defaultChannel
-                    );
-                    
-                    if (!channel || !(channel instanceof TextChannel)) { 
-                        console.error(`Could not find channel to transcribe to!`);
-                        return;
-                    }
-
-                    try {
-                        const webhooks = await channel.fetchWebhooks();
-                        let webhook = webhooks.find(wh => wh.name === "Deepgram");
-                        const member = interaction.guild?.members.cache.get(userId);
-                        const avatarUrl = member?.displayAvatarURL() || '';
-                        
-                        if (webhook) {
-                            createListeningStream(webhook, recording, receiver, userId, displayName, avatarUrl, interaction.guildId);
-                        } else {
-                            console.log(`Could not find webhook! Creating...`);
-                            
-                            try {
-                                const newWebhook = await channel.createWebhook({
-                                    name: "Deepgram",
-                                    avatar: "https://www.deepgram.com/favicon.ico"
-                                });
-                                console.log(`Created Deepgram webhook ${newWebhook.id}`);
-                                createListeningStream(newWebhook, recording, receiver, userId, displayName, avatarUrl, interaction.guildId);
-                            } catch (error) {
-                                if (error instanceof DiscordAPIError && error.code === 50013) {
-                                    console.error('Bot lacks permission to create webhooks. Please ensure the bot has the "Manage Webhooks" permission.');
-                                } else {
-                                    console.error('Error creating webhook:', error);
-                                }
-                                recording.delete(userId);
-                            }
-                        }
-                    } catch (error) {
-                        if (error instanceof DiscordAPIError && error.code === 50013) {
-                            console.error('Bot lacks permission to fetch webhooks. Please ensure the bot has the "Manage Webhooks" permission.');
-                        } else {
-                            console.error('Error fetching webhooks:', error);
-                        }
-                        recording.delete(userId);
-                    }
-                } catch (error) {
-                    console.error('Error setting up transcription:', error);
-                    recording.delete(userId);
-                }
-            }
-		});
 	} catch (error) {
 		console.warn('Connection error:', error);
 		await interaction.followUp('Failed to join voice channel within 20 seconds, please try again later!');
@@ -263,7 +185,7 @@ async function record(
 		}
 
 		const humanMembers = member.voice.channel.members.filter(m => !m.user.bot);
-		await startManualRecording(
+		const started = await startManualRecording(
 			interaction.guildId,
 			member.voice.channel.id,
 			member.voice.channel.name,
@@ -273,7 +195,9 @@ async function record(
 		);
 
 		await interaction.editReply({
-			content: 'Started recording everyone in your voice channel. A transcript and summary will be generated when the recording ends.'
+			content: started
+                ? 'Started recording everyone in your voice channel. A transcript and summary will be generated when the recording ends.'
+                : 'A recording is starting or finishing, or is active in another channel. Please try again shortly.'
 		});
 	} catch (error) {
 		console.error('Error setting up connection for record command:', error);

@@ -2,12 +2,12 @@ import { Client, GatewayIntentBits, Interaction, ChannelType, TextChannel, Disco
 import { getVoiceConnection, version as discordVoiceVersion, generateDependencyReport } from '@discordjs/voice';
 import { deploy } from './deploy';
 import { interactionHandlers } from './interactions';
-import { handleVoiceStateUpdate, isRecording, stopRecording } from './voiceStateManager';
+import { handleVoiceStateUpdate, shutdownRecordings } from './voiceStateManager';
 import { ensureDirectoryExists } from './utils';
 import config from './config';
 
 // Extract config values
-const { token, defaultChannel, claudeApiKey, deepgram_token, voiceDebugLogs } = config;
+const { token, defaultChannel, openaiApiKey, deepgram_token, voiceDebugLogs } = config;
 
 // Validate required tokens
 if (!token) {
@@ -20,9 +20,9 @@ if (!deepgram_token) {
     console.error('Transcription will not work without a Deepgram API token.');
 }
 
-if (!claudeApiKey) {
-    console.error('❌ WARNING: No Claude API key found!');
-    console.error('Summary generation will not work without a Claude API key.');
+if (!openaiApiKey) {
+    console.error('❌ WARNING: No OpenAI API key found!');
+    console.error('Summary generation will not work without an OpenAI API key.');
 }
 
 // Ensure necessary directories exist
@@ -146,62 +146,33 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
 });
 
-// Add graceful shutdown handling
-process.on('SIGTERM', async () => {
-    console.log('🛑 Received SIGTERM signal. Shutting down gracefully...');
-    
+// One shutdown handler for the process; utterances never install signal listeners.
+let shuttingDown = false;
+async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log('Shutting down: draining audio and delivering transcripts...');
+    const deadline = setTimeout(() => {
+        console.error('Shutdown deadline reached; exiting.');
+        process.exit(1);
+    }, 25_000);
     try {
-        // Stop all active recordings
-        const guilds = client.guilds.cache;
-        console.log(`🔄 Stopping recordings in ${guilds.size} guilds...`);
-        
-        // Create an array of promises for stopping recordings
-        const stopPromises = [];
-        
-        for (const [guildId, guild] of guilds) {
-            if (isRecording(guildId)) {
-                console.log(`🛑 Stopping recording in guild: ${guild.name} (${guildId})`);
-                stopPromises.push(stopRecording(guildId, client, true));
-            }
-        }
-        
-        // Wait for all recordings to stop with a timeout
-        if (stopPromises.length > 0) {
-            console.log(`⏱️ Waiting for ${stopPromises.length} recordings to stop...`);
-            await Promise.all(stopPromises.map(p => Promise.race([
-                p,
-                new Promise(resolve => setTimeout(resolve, 5000)) // 5 second timeout
-            ])));
-        }
-        
-        // Destroy all voice connections
-        console.log('🔌 Destroying all voice connections...');
-        for (const [guildId, guild] of guilds) {
+        await shutdownRecordings(client);
+        for (const guildId of client.guilds.cache.keys()) {
             const connection = getVoiceConnection(guildId);
-            if (connection) {
-                console.log(`🔌 Destroying voice connection in guild: ${guild.name} (${guildId})`);
-                connection.destroy();
-            }
+            if (connection) connection.destroy();
         }
-        
-        // Destroy the client
-        console.log('👋 Logging out of Discord...');
         await client.destroy();
-        
-        console.log('✅ Graceful shutdown complete. Exiting...');
+        clearTimeout(deadline);
         process.exit(0);
     } catch (error) {
-        console.error('❌ Error during graceful shutdown:', error);
+        console.error('Graceful shutdown failed:', error);
+        clearTimeout(deadline);
         process.exit(1);
     }
-});
-
-// Add SIGINT handler for local development
-process.on('SIGINT', () => {
-    console.log('Received SIGINT. Triggering graceful shutdown...');
-    // Trigger the same shutdown process as SIGTERM
-    process.emit('SIGTERM');
-});
+}
+process.once('SIGTERM', shutdown);
+process.once('SIGINT', shutdown);
 
 client.on('error', console.warn);
 

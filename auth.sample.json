@@ -1,7 +1,7 @@
 {
     "token": "YOUR_DISCORD_BOT_TOKEN",
     "defaultChannel": "transcripts",
-    "claudeApiKey": "YOUR_CLAUDE_API_KEY",
+    "openaiApiKey": "YOUR_OPENAI_API_KEY",
     "deepgram_token": "YOUR_DEEPGRAM_API_TOKEN",
     "transcriptChannelId": "YOUR_TRANSCRIPT_CHANNEL_ID"
 } 
