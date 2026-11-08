@@ -10,6 +10,49 @@ A Discord bot that joins voice channels, records audio, and generates transcript
 - Automatically handle voice channel events
 - Command-based recording control
 
+## One-off forum transcript export
+
+Requires Node 18+ and the existing bot token. This standalone script has no npm
+dependencies and only reads Discord; it does not start the voice bot or post messages.
+
+```bash
+# Uses DISCORD_TOKEN / TRANSCRIPT_CHANNEL_ID, or the existing auth.json:
+npm run export:forum -- --channel-id 740936087412801617 --timezone America/New_York
+
+# Alternatively, read the deployed bot's credentials with the authenticated Heroku CLI:
+npm run export:forum -- --heroku-app discord-transcription-bot --timezone America/New_York
+```
+
+Each run creates a new ignored `exports/forum-<timestamp>/` directory containing:
+
+- `transcript-bundle.txt`: chronological index, titles, posting dates/times, participants,
+  original summaries, full transcript text, and source message links.
+- `recordings.json`: the same recordings and metadata in machine-readable form.
+- `manifest.json`: export counts, scanned channels, timezone, and coverage warnings.
+- `source-messages.json`: original bot messages for checking ambiguous matches.
+
+The script checks the channel and its active and archived threads (or posts in a
+Discord Forum channel), paginates message history, downloads original `.md`/`.txt`
+transcript attachments, and joins split summary messages. Only posts by the
+authenticated bot are included; use `--bot-id ID` for a different original author.
+The bot needs View Channel and Read Message History. Manage Threads allows a complete
+enumeration of private archived threads; missing access is reported as a warning.
+Deleted messages, removed files, and inaccessible channels cannot be recovered.
+
+Dates are explicitly labeled as posting times. Original title dates, recording-start/
+stop notices, and reported durations (when available) are preserved separately. Participants combine the posted
+recording list and transcript speaker labels without guessing real names. Summary-only
+records, surviving partial summaries, unmatched attachments, and failed downloads are retained with warnings rather
+than silently dropped. Legacy separate attachments are paired with the preceding
+summary only within 15 minutes and when the transcript title agrees. No AI generation
+or transcription service is used. The export contains private conversation history;
+keep it outside version control.
+
+Optional flags: `--output NEW_DIRECTORY`, `--auth-file PATH`, `--timezone IANA_ZONE`.
+Existing output directories are never overwritten. Exit code 2 means no records were
+found or attachment downloads failed; inspect the manifest and individual warnings.
+Run the focused regression checks with `npm run test:export`.
+
 ## Local Development
 
 1. Clone the repository

@@ -4,3 +4,4 @@ recordings/*
 auth.json
 *.py
 .DS_Store
+exports/

@@ -10,6 +10,8 @@
 		"prettier": "prettier --write .",
 		"build": "npx tsc",
 		"build:check": "npx tsc --noEmit --incremental false",
+		"export:forum": "node scripts/export-forum-transcripts.mjs",
+		"test:export": "node --test scripts/export-forum-transcripts.test.mjs",
 		"heroku-postbuild": "npm run build"
 	},
 	"author": "Amish Shah <contact@shah.gg>",

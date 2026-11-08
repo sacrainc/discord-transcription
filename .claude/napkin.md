@@ -3,6 +3,7 @@
 ## Corrections
 | Date | Source | What Went Wrong | What To Do Instead |
 |------|--------|----------------|-------------------|
+| 2026-11-02 | self | First archive run had no intermediate progress while scanning/downloading a large history. | Log message totals before downloads and attachment progress every 25 files; save source messages before downloads. |
 | 2026-03-03 | self | Initially assumed `AbortError` during voice join meant the connection was explicitly destroyed by overlapping starts. | Confirm `@discordjs/voice` error semantics in source; `entersState(..., timeout)` aborts with `AbortError` on timeout. |
 | 2026-03-04 | self | Upgrading to `@discordjs/voice@0.19.0` alone did not enable DAVE in production. | Install `@snazzah/davey` explicitly in app dependencies; otherwise `max_dave_protocol_version` stays `0` and post-2026-03-02 voice joins fail. |
 | 2026-03-04 | self | Left temporary high-volume diagnostics enabled after incident triage. | Gate voice handshake debug logs and dependency report behind `VOICE_DEBUG_LOGS=true`; keep default logs concise. |
@@ -20,6 +21,10 @@
 - None recorded yet.
 
 ## Domain Notes
+- 2026-11-07: Created exports/walter-jan-2026-05-07-to-2026-11-07/transcript-bundle.txt: 130 exact-pair Jan/Walter calls (jan + smalter), using calendar window May 7–Nov 7 ET, refreshing messages since the Nov 2 archive. All selected calls have full transcripts and summaries; group calls excluded. Private archived thread enumeration remains permission-limited.
+- 2026-11-02: Forum export work lives in ../discord-transcription-forum-export on feat/forum-transcript-export, based on deployed abedb4b. Leave the original worktree's ongoing transcript-reliability edits untouched.
+- Sacra #forum is a regular text channel (740936087412801617), not a Discord Forum container. Bot user 1344746486256111687 posts summary headers/continuations and then separate transcript-*.md attachments. Existing Heroku app discord-transcription-bot has read credentials; never log config values or tokens.
+- Historical export edge cases: 2026-02-24 repeated the title/participants on `Summary (continued):` posts; merge those into the same recording. Two 2026-03-30 meetings retain only final summary sections (no header); preserve those with a partial-summary warning and infer title/participants from the attachment.
 - Project: `discord-transcription`.
 - User wants Anthropic model references modernized from Sonnet 3.7-era naming to `claude-sonnet-4-6`.
 - Anthropic model is hardcoded in `src/transcriptManager.ts` at each `anthropic.messages.create` call; keep these in sync when changing models.
